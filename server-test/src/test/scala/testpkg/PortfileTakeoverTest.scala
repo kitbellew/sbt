@@ -18,23 +18,37 @@ import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 import scala.util.Properties.isLinux
 
+import org.scalatest.Outcome
+
 /**
  * An sbt server that finds another one serving the build keeps the build loaded and serves
  * nothing. This covers what becomes of the portfile when a client deletes it while such a
  * server is sitting there.
+ *
+ * A case leaves the build with no portfile, or with one that names the sbt server it forked,
+ * so each case gets a suite and a server of its own.
  */
-class PortfileTakeoverTest extends AbstractServerTest:
+trait AbstractTakeoverTest extends AbstractServerTest:
   override val testDirectory: String = "client"
 
-  private val settle = 90.seconds
+  protected val settle: FiniteDuration = 90.seconds
 
-  private def portfile: File = svr.baseDirectory / "project" / "target" / "active.json"
+  protected def portfile: File = svr.baseDirectory / "project" / "target" / "active.json"
+  protected def marker: File = svr.baseDirectory / "loaded.txt"
+  private def logfile: File = svr.baseDirectory / "another-server.log"
+
+  /** The forked sbt server writes nowhere a failing run can reach, so hand its log over. */
+  override protected def withFixture(test: NoArgTest): Outcome =
+    val outcome = super.withFixture(test)
+    if !outcome.isSucceeded && logfile.exists then
+      System.err.println(IO.readLines(logfile).takeRight(40).mkString("\n"))
+    outcome
 
   /**
-   * Another sbt server on this build. It finds the socket taken, loads the project again, and
-   * then waits in the shell with the build loaded.
+   * Another sbt server on this build. It finds the socket taken, and then waits in the shell
+   * with the build loaded.
    */
-  private def anotherServer(reloading: Boolean): Process =
+  protected def anotherServer(reloading: Boolean): Process =
     val java = new File(new File(System.getProperty("java.home"), "bin"), "java").toString
     val classpath = TestProperties.classpath
     val jvm = List(java, "-Djline.terminal=none", "-Dsbt.io.virtual=false", "-Dsbt.banner=false")
@@ -57,19 +71,20 @@ class PortfileTakeoverTest extends AbstractServerTest:
      * down as soon as it finds it serves nothing.
      */
     builder.environment.remove("SBT_TERMINAL_PROPS")
+    IO.delete(marker)
     builder
       .directory(svr.baseDirectory)
-      .redirectOutput(Redirect.DISCARD)
+      .redirectOutput(Redirect.to(logfile))
       .redirectErrorStream(true)
       .start()
   end anotherServer
+end AbstractTakeoverTest
 
-  /* Linux alone: forking a second sbt server is expensive, and this behaviour is the same
-   * everywhere. */
+/* Linux alone: forking a second sbt server is expensive, and this behaviour is the same
+ * everywhere. */
+class PortfileTakeoverAfterLoadTest extends AbstractTakeoverTest:
   test("a portfile deleted while another sbt server is loaded") {
     if isLinux then
-      val marker = svr.baseDirectory / "loaded.txt"
-      IO.delete(marker)
       val another = anotherServer(reloading = true)
       try
         assert(waitUntil(settle)(marker.exists), "another sbt server loads the build twice")
@@ -78,12 +93,12 @@ class PortfileTakeoverTest extends AbstractServerTest:
         assert(!waitUntil(settle)(portfile.exists), "the portfile stays deleted")
       finally another.destroy()
   }
+end PortfileTakeoverAfterLoadTest
 
-  /* Linux alone, for the same reason. */
+/* Linux alone, for the same reason. */
+class PortfileTakeoverTest extends AbstractTakeoverTest:
   test("a portfile deleted while another sbt server waits") {
     if isLinux then
-      val marker = svr.baseDirectory / "loaded.txt"
-      IO.delete(marker)
       val another = anotherServer(reloading = false)
       try
         assert(waitUntil(settle)(marker.exists), "another sbt server loads the build")
